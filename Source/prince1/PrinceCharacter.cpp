@@ -5,6 +5,8 @@
 #include "InventoryComponent.h"
 #include "InteractPromptWidget.h"
 #include "InventoryWidget.h"
+#include "DialogueWidget.h"
+#include "DialogueDataAsset.h"
 #include "Interactable.h"
 
 #include "Blueprint/UserWidget.h"
@@ -16,6 +18,7 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "TimerManager.h"
 
 APrinceCharacter::APrinceCharacter(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer.SetDefaultSubobjectClass<UPlanetCharacterMovementComponent>(
@@ -116,8 +119,30 @@ void APrinceCharacter::BeginPlay()
 					InventoryWidget->BindToInventory(Inventory);
 				}
 			}
+
+			if (DialogueWidgetClass)
+			{
+				DialogueWidget = CreateWidget<UDialogueWidget>(PC, DialogueWidgetClass);
+				if (DialogueWidget)
+				{
+					// Above prompt(10) and inventory(5); dialogue is the foreground modal.
+					DialogueWidget->AddToViewport(/*ZOrder=*/20);
+					DialogueWidget->OnDialogueClosed.RemoveAll(this);
+					DialogueWidget->OnDialogueClosed.AddUObject(this, &APrinceCharacter::HandleDialogueClosed);
+				}
+			}
 		}
 	}
+}
+
+void APrinceCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (DialogueWidget)
+	{
+		DialogueWidget->OnDialogueClosed.RemoveAll(this);
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 void APrinceCharacter::PawnClientRestart()
@@ -163,12 +188,98 @@ void APrinceCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 	}
 }
 
+void APrinceCharacter::SetCurrentPlanet(APlanetActor* NewPlanet)
+{
+	CurrentPlanet = NewPlanet;
+
+	// Propagate to the movement component so gravity direction tracks the new planet
+	// from the very next physics step.
+	if (auto* PlanetCMC = Cast<UPlanetCharacterMovementComponent>(GetCharacterMovement()))
+	{
+		PlanetCMC->SetPlanet(NewPlanet);
+	}
+
+	// Re-derive CameraForwardFlat in the new planet's tangent plane so the camera
+	// doesn't snap when Tick re-orthogonalises against a surface normal that has
+	// just rotated relative to world space.
+	if (NewPlanet)
+	{
+		const FVector Up = (GetActorLocation() - NewPlanet->GetCenter()).GetSafeNormal();
+		CameraForwardFlat = FVector::VectorPlaneProject(GetActorForwardVector(), Up).GetSafeNormal();
+		if (CameraForwardFlat.IsNearlyZero())
+		{
+			const FVector AnyPerp = FMath::Abs(Up.X) < 0.9f ? FVector(1, 0, 0) : FVector(0, 1, 0);
+			CameraForwardFlat = FVector::VectorPlaneProject(AnyPerp, Up).GetSafeNormal();
+		}
+	}
+
+	// Spring arm caches its previous-frame world position for the lag lerp. After
+	// a long-distance teleport that cache points back at the *old planet*, so the
+	// next ticks would interpolate the camera from there into the new desired
+	// position — visible as the camera "flying in" once the post-teleport fade-in
+	// clears.
+	//
+	// Suppress lag for ~6 frames so the spring arm snaps cleanly to its new
+	// target. The window is well inside the typical fade-in (0.5 s) so the
+	// snap is invisible to the player. Lag is restored to its prior value
+	// afterward so we don't permanently disable the polish for normal play.
+	if (SpringArm && SpringArm->bEnableCameraLag)
+	{
+		SpringArm->bEnableCameraLag = false;
+
+		FTimerHandle CamLagRestoreHandle;
+		GetWorldTimerManager().SetTimer(
+			CamLagRestoreHandle,
+			FTimerDelegate::CreateWeakLambda(this, [this]()
+			{
+				if (SpringArm)
+				{
+					SpringArm->bEnableCameraLag = true;
+				}
+			}),
+			0.1f, /*bLoop=*/false);
+	}
+}
+
+void APrinceCharacter::BeginDialogue(const FText& NPCName, UDialogueDataAsset* Dialogue)
+{
+	// Reject if no widget was assigned in BP, no data to play, or we're already
+	// in a conversation (NPC OnInteract also guards, but defend in depth).
+	if (!DialogueWidget || !Dialogue || bIsInDialogue)
+	{
+		return;
+	}
+
+	bIsInDialogue = true;
+
+	// Hide the interact prompt so the player isn't told to press [E] for
+	// "Talk" while the dialogue panel is already up.
+	if (PromptWidget)
+	{
+		PromptWidget->SetPrompt(FText::GetEmpty());
+	}
+
+	// Drop any cached focused target so the next post-dialogue scan starts
+	// clean rather than instantly re-triggering the same NPC.
+	FocusedInteractable = nullptr;
+
+	DialogueWidget->StartDialogue(NPCName, Dialogue);
+}
+
+void APrinceCharacter::HandleDialogueClosed()
+{
+	bIsInDialogue = false;
+	// Next Tick will resume UpdateFocusedInteractable and refresh the prompt.
+}
+
 void APrinceCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
 	// ─── Interaction scan ──────────────────────────────────────────────────────
-	if (IsLocallyControlled())
+	// Pause scanning while a dialogue is open: the prompt is hidden and [E]
+	// routes to Advance() instead of (re)triggering the focused interactable.
+	if (IsLocallyControlled() && !bIsInDialogue)
 	{
 		UpdateFocusedInteractable();
 	}
@@ -282,6 +393,22 @@ void APrinceCharacter::OnJumpReleased(const FInputActionValue& /*Value*/)
 
 void APrinceCharacter::OnInteractStarted(const FInputActionValue& /*Value*/)
 {
+	// During dialogue, the interact key advances the conversation rather than
+	// triggering whatever happens to be in the overlap radius (which could be
+	// the same NPC and instantly re-open a fresh dialogue).
+	if (bIsInDialogue)
+	{
+		if (DialogueWidget && DialogueWidget->IsDialogueActive())
+		{
+			DialogueWidget->Advance();
+		}
+		else
+		{
+			bIsInDialogue = false;
+		}
+		return;
+	}
+
 	AActor* Target = FocusedInteractable.Get();
 	if (!Target || !Target->Implements<UInteractable>())
 	{

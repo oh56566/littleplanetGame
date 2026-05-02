@@ -13,6 +13,8 @@ class APlanetActor;
 class UInventoryComponent;
 class UInteractPromptWidget;
 class UInventoryWidget;
+class UDialogueWidget;
+class UDialogueDataAsset;
 
 UCLASS()
 class PRINCE1_API APrinceCharacter : public ACharacter
@@ -26,8 +28,36 @@ public:
 	virtual void PawnClientRestart() override;
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 
+	/**
+	 * Switches the character's reference planet at runtime.
+	 *
+	 * Updates CurrentPlanet, propagates to UPlanetCharacterMovementComponent
+	 * (changing gravity direction immediately), and re-initialises
+	 * CameraForwardFlat so the camera doesn't snap on the next tick when the
+	 * surface normal changes orientation.
+	 *
+	 * Intended caller: APortalActor on teleport.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Planet")
+	void SetCurrentPlanet(APlanetActor* NewPlanet);
+
+	/**
+	 * Routes the player into a dialogue with the given NPC. Suppresses the
+	 * interact prompt, gates further interactable scans, and tells the
+	 * DialogueWidget to start playback. No-op if a dialogue is already active
+	 * or if no widget class was assigned.
+	 *
+	 * Intended caller: ANPCActor::OnInteract.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Dialogue")
+	void BeginDialogue(const FText& NPCName, UDialogueDataAsset* Dialogue);
+
+	UFUNCTION(BlueprintPure, Category = "Dialogue")
+	bool IsInDialogue() const { return bIsInDialogue; }
+
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
 	TObjectPtr<USpringArmComponent> SpringArm;
@@ -80,6 +110,13 @@ protected:
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "Interaction")
 	TObjectPtr<UInventoryWidget> InventoryWidget;
 
+	/** Widget class spawned and added to viewport for NPC dialogue playback. */
+	UPROPERTY(EditDefaultsOnly, Category = "Dialogue")
+	TSubclassOf<UDialogueWidget> DialogueWidgetClass;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "Dialogue")
+	TObjectPtr<UDialogueWidget> DialogueWidget;
+
 	UPROPERTY(EditAnywhere, Category = "Camera")
 	float LookPitchMin = -75.f;
 
@@ -101,6 +138,13 @@ private:
 
 	/** Sphere-overlap scan for the closest valid IInteractable actor. */
 	void UpdateFocusedInteractable();
+
+	/** Bound to UDialogueWidget::OnDialogueClosed; clears bIsInDialogue. */
+	UFUNCTION()
+	void HandleDialogueClosed();
+
+	/** True between BeginDialogue and the widget's OnDialogueClosed broadcast. */
+	bool bIsInDialogue = false;
 
 	// World-space camera direction, always kept perpendicular to current planet Up.
 	// Rotated by mouse X (yaw around Up). Used as the reference for both movement and camera.
