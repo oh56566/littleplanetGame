@@ -2,10 +2,16 @@
 
 #include "PlanetActor.h"
 #include "PlanetCharacterMovementComponent.h"
+#include "InventoryComponent.h"
+#include "InteractPromptWidget.h"
+#include "InventoryWidget.h"
+#include "Interactable.h"
 
+#include "Blueprint/UserWidget.h"
 #include "Camera/CameraComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/OverlapResult.h"
 #include "EngineUtils.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -29,7 +35,7 @@ APrinceCharacter::APrinceCharacter(const FObjectInitializer& ObjectInitializer)
 		// Character facing is handled manually in CMC::TickComponent (velocity-based yaw).
 		MoveComp->bOrientRotationToMovement = false;
 		MoveComp->JumpZVelocity             = 600.f;
-		MoveComp->AirControl                = 0.35f;
+		MoveComp->AirControl                = 0.35f; // default is 0.35f
 		MoveComp->MaxWalkSpeed              = 500.f;
 		MoveComp->MinAnalogWalkSpeed        = 20.f;
 		MoveComp->BrakingDecelerationWalking = 2000.f;
@@ -47,6 +53,8 @@ APrinceCharacter::APrinceCharacter(const FObjectInitializer& ObjectInitializer)
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
 	Camera->bUsePawnControlRotation = false;
+
+	Inventory = CreateDefaultSubobject<UInventoryComponent>(TEXT("Inventory"));
 }
 
 void APrinceCharacter::BeginPlay()
@@ -82,6 +90,33 @@ void APrinceCharacter::BeginPlay()
 	else
 	{
 		CameraForwardFlat = GetActorForwardVector();
+	}
+
+	// Spawn HUD widgets for the local player (skip on dedicated server).
+	if (IsLocallyControlled())
+	{
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		{
+			if (PromptWidgetClass)
+			{
+				PromptWidget = CreateWidget<UInteractPromptWidget>(PC, PromptWidgetClass);
+				if (PromptWidget)
+				{
+					PromptWidget->AddToViewport(/*ZOrder=*/10);
+					PromptWidget->SetPrompt(FText::GetEmpty());
+				}
+			}
+
+			if (InventoryWidgetClass)
+			{
+				InventoryWidget = CreateWidget<UInventoryWidget>(PC, InventoryWidgetClass);
+				if (InventoryWidget)
+				{
+					InventoryWidget->AddToViewport(/*ZOrder=*/5);
+					InventoryWidget->BindToInventory(Inventory);
+				}
+			}
+		}
 	}
 }
 
@@ -121,12 +156,22 @@ void APrinceCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 			EIC->BindAction(JumpAction, ETriggerEvent::Started,    this, &APrinceCharacter::OnJumpStarted);
 			EIC->BindAction(JumpAction, ETriggerEvent::Completed,  this, &APrinceCharacter::OnJumpReleased);
 		}
+		if (InteractAction)
+		{
+			EIC->BindAction(InteractAction, ETriggerEvent::Started, this, &APrinceCharacter::OnInteractStarted);
+		}
 	}
 }
 
 void APrinceCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+
+	// ─── Interaction scan ──────────────────────────────────────────────────────
+	if (IsLocallyControlled())
+	{
+		UpdateFocusedInteractable();
+	}
 
 	// ─── Camera ────────────────────────────────────────────────────────────────
 	// SpringArm rotation is set in world space so it's completely independent of
@@ -233,4 +278,75 @@ void APrinceCharacter::OnJumpStarted(const FInputActionValue& /*Value*/)
 void APrinceCharacter::OnJumpReleased(const FInputActionValue& /*Value*/)
 {
 	StopJumping();
+}
+
+void APrinceCharacter::OnInteractStarted(const FInputActionValue& /*Value*/)
+{
+	AActor* Target = FocusedInteractable.Get();
+	if (!Target || !Target->Implements<UInteractable>())
+	{
+		return;
+	}
+	if (!IInteractable::Execute_CanInteract(Target, this))
+	{
+		return;
+	}
+	IInteractable::Execute_OnInteract(Target, this);
+
+	// Refresh prompt immediately — the interaction may have changed CanInteract.
+	UpdateFocusedInteractable();
+}
+
+void APrinceCharacter::UpdateFocusedInteractable()
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// Sphere overlap centred on the character. Cheap on a small planet and works
+	// regardless of facing direction (closest-wins picks the natural target).
+	const FVector Origin = GetActorLocation();
+	const FCollisionShape Shape = FCollisionShape::MakeSphere(InteractRadius);
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(InteractScan), false, this);
+	Params.AddIgnoredActor(this);
+
+	TArray<FOverlapResult> Overlaps;
+	World->OverlapMultiByChannel(Overlaps, Origin, FQuat::Identity, ECC_WorldDynamic, Shape, Params);
+	// Also check static channel so static-mesh-only pickups are caught.
+	TArray<FOverlapResult> StaticOverlaps;
+	World->OverlapMultiByChannel(StaticOverlaps, Origin, FQuat::Identity, ECC_WorldStatic, Shape, Params);
+	Overlaps.Append(StaticOverlaps);
+
+	AActor* Best = nullptr;
+	float   BestDistSq = TNumericLimits<float>::Max();
+
+	for (const FOverlapResult& O : Overlaps)
+	{
+		AActor* A = O.GetActor();
+		if (!A || !A->Implements<UInteractable>())
+		{
+			continue;
+		}
+		if (!IInteractable::Execute_CanInteract(A, this))
+		{
+			continue;
+		}
+		const float DistSq = FVector::DistSquared(Origin, A->GetActorLocation());
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			Best       = A;
+		}
+	}
+
+	FocusedInteractable = Best;
+
+	if (PromptWidget)
+	{
+		const FText Prompt = Best ? IInteractable::Execute_GetInteractPrompt(Best) : FText::GetEmpty();
+		PromptWidget->SetPrompt(Prompt);
+	}
 }
